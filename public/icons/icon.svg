@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#e8603c"/>
+      <stop offset="1" stop-color="#f6a650"/>
+    </linearGradient>
+    <radialGradient id="petal" gradientUnits="userSpaceOnUse" cx="256" cy="256" r="150">
+      <stop offset="0" stop-color="#ffc738"/>
+      <stop offset=".42" stop-color="#ffe9a8"/>
+      <stop offset=".7" stop-color="#fffdf7"/>
+    </radialGradient>
+    <path id="p" d="M256 256C214 214 196 152 232 124c30-24 78-4 88 42 7 34-18 72-64 90z" fill="url(#petal)"/>
+  </defs>
+  <rect width="512" height="512" fill="url(#sky)"/>
+  <use href="#p"/>
+  <use href="#p" transform="rotate(72 256 256)"/>
+  <use href="#p" transform="rotate(144 256 256)"/>
+  <use href="#p" transform="rotate(216 256 256)"/>
+  <use href="#p" transform="rotate(288 256 256)"/>
+</svg>

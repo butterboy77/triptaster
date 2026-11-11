@@ -1,0 +1,14 @@
+{
+  "name": "triptaster",
+  "version": "1.0.0",
+  "description": "A self-hosted food diary and lucky dip for trips with friends",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "repository": { "type": "git", "url": "https://github.com/butterboy77/triptaster.git" },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test \"test/*.test.js\""
+  }
+}

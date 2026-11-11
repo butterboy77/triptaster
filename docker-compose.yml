@@ -1,0 +1,14 @@
+services:
+  triptaster:
+    image: ghcr.io/butterboy77/triptaster:latest
+    # To build from source instead, replace the line above with:  build: .
+    container_name: triptaster
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    env_file: .env
+    volumes:
+      - triptaster-data:/data
+
+volumes:
+  triptaster-data:
