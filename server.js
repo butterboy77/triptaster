@@ -36,6 +36,9 @@ const oidc = process.env.OIDC_ISSUER
 const passwordLogin = flag('PASSWORD_LOGIN', true);
 if (!passwordLogin && !oidc) fail('PASSWORD_LOGIN is off and OIDC is not configured, so nobody could sign in');
 
+const photoLimitGb = Number(process.env.PHOTO_STORAGE_LIMIT_GB || 0);
+if (!Number.isFinite(photoLimitGb) || photoLimitGb < 0) fail('PHOTO_STORAGE_LIMIT_GB must be a number of gigabytes, e.g. 5');
+
 const port = Number(process.env.PORT || 3000);
 const server = createApp({
   baseUrl,
@@ -43,6 +46,7 @@ const server = createApp({
   passwordLogin,
   trustProxy: flag('TRUST_PROXY', false),
   oidc,
+  photoLimitBytes: Math.round(photoLimitGb * 1e9),
 });
 server.listen(port, () => {
   const methods = [passwordLogin && 'passwords', oidc && `OIDC (${oidc.issuer})`].filter(Boolean).join(' and ');

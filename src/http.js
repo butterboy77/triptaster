@@ -34,6 +34,19 @@ export async function readJson(req, maxBytes = 64 * 1024) {
   }
 }
 
+// Reads a raw request body into memory, refusing anything over maxBytes.
+export async function readBody(req, maxBytes) {
+  if (Number(req.headers['content-length']) > maxBytes) throw new HttpError(413, 'That file is too big');
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > maxBytes) throw new HttpError(413, 'That file is too big');
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
 export function send(res, status, body, headers = {}) {
   res.writeHead(status, headers);
   res.end(body);

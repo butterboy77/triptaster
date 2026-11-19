@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDb, transaction } from './db.js';
-import { HttpError, parseCookies, readJson, json, send, redirect } from './http.js';
+import { HttpError, parseCookies, readJson, readBody, json, send, redirect } from './http.js';
 import {
   sha256,
   randomToken,
@@ -24,6 +24,18 @@ import {
   validDate,
   shortText,
 } from './validate.js';
+import { createPhotoStore, imageType, MAX_PHOTO_BYTES, MAX_THUMB_BYTES, PHOTO_MIME } from './photos.js';
+import { writeBackup, restoreArchive, restoreJson } from './backup.js';
+import {
+  listTrips,
+  listVenues,
+  insertVenue,
+  updateVenue,
+  insertPhoto,
+  photoBytesUsed,
+  photosOfVenue,
+  photosOfTrip,
+} from './store.js';
 
 const PUBLIC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
 const SESSION_COOKIE = 'triptaster_session';
@@ -40,7 +52,7 @@ const MIME = {
   '.txt': 'text/plain; charset=utf-8',
   '.webmanifest': 'application/manifest+json',
 };
-const CSP = "default-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
+const CSP = "default-src 'self'; img-src 'self' data: blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
 
 function loadStatic() {
   const files = new Map();
@@ -57,13 +69,16 @@ function loadStatic() {
  * config: {
  *   baseUrl, dataDir, passwordLogin, trustProxy,
  *   oidc: null | { issuer, clientId, clientSecret, label, autoRegister, allowedGroups },
- *   scryptN (password hashing cost), log
+ *   photoLimitBytes (0 for no limit), scryptN (password hashing cost), log
  * }
  */
 export function createApp(config) {
   const db = openDb(config.dataDir);
   const staticFiles = loadStatic();
   const log = config.log ?? console.log;
+  const photos = createPhotoStore(config.dataDir);
+  const swept = photos.sweep(new Set(db.prepare('SELECT file FROM photos').all().map((p) => p.file)));
+  if (swept) log(`Removed ${swept} leftover photo files`);
   const scryptN = config.scryptN ?? 2 ** 17;
   const secureCookies = config.baseUrl.startsWith('https://');
   const appOrigin = new URL(config.baseUrl).origin;
@@ -193,115 +208,13 @@ export function createApp(config) {
     return venue;
   }
 
-  function listTrips() {
-    return db
-      .prepare(
-        `SELECT t.*,
-           (SELECT COUNT(*) FROM venues v WHERE v.trip_id = t.id) AS venue_count,
-           (SELECT COUNT(DISTINCT v.id) FROM venues v JOIN visits x ON x.venue_id = v.id WHERE v.trip_id = t.id) AS been_count
-         FROM trips t ORDER BY t.created_at DESC, t.id DESC`,
-      )
-      .all();
+  function requirePhoto(id) {
+    const photo = db.prepare('SELECT * FROM photos WHERE id = ?').get(id);
+    if (!photo) throw new HttpError(404, 'That photo no longer exists');
+    return photo;
   }
 
-  function listVenues(tripId) {
-    const visits = db
-      .prepare('SELECT x.* FROM visits x JOIN venues v ON v.id = x.venue_id WHERE v.trip_id = ? ORDER BY visited_on DESC, x.id DESC')
-      .all(tripId);
-    const ratings = db.prepare('SELECT r.* FROM ratings r JOIN venues v ON v.id = r.venue_id WHERE v.trip_id = ?').all(tripId);
-    return db
-      .prepare('SELECT * FROM venues WHERE trip_id = ? ORDER BY created_at DESC, id DESC')
-      .all(tripId)
-      .map((venue) => ({
-        ...venue,
-        moments: JSON.parse(venue.moments),
-        visits: visits.filter((v) => v.venue_id === venue.id),
-        ratings: ratings.filter((r) => r.venue_id === venue.id),
-      }));
-  }
-
-  function saveVenue(v, { tripId, venueId, userId }) {
-    if (venueId) {
-      db.prepare(
-        `UPDATE venues SET name = ?, kind = ?, moments = ?, cuisine = ?, area = ?, price = ?, maps_url = ?, must_try = ?, notes = ?
-         WHERE id = ?`,
-      ).run(v.name, v.kind, v.moments, v.cuisine, v.area, v.price, v.maps_url, v.must_try, v.notes, venueId);
-      return venueId;
-    }
-    const { lastInsertRowid } = db
-      .prepare(
-        `INSERT INTO venues (trip_id, name, kind, moments, cuisine, area, price, maps_url, must_try, notes, added_by)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(tripId, v.name, v.kind, v.moments, v.cuisine, v.area, v.price, v.maps_url, v.must_try, v.notes, userId);
-    return Number(lastInsertRowid);
-  }
-
-  // Export and import, with people referred to by username so files move between servers.
-
-  function exportData() {
-    const usernames = new Map(db.prepare('SELECT id, username FROM users').all().map((u) => [u.id, u.username]));
-    return {
-      app: 'triptaster',
-      format: 1,
-      exported_at: new Date().toISOString(),
-      trips: listTrips().map((trip) => ({
-        name: trip.name,
-        city: trip.city,
-        venues: listVenues(trip.id).map((v) => ({
-          name: v.name,
-          kind: v.kind,
-          moments: v.moments,
-          cuisine: v.cuisine,
-          area: v.area,
-          price: v.price,
-          maps_url: v.maps_url,
-          must_try: v.must_try,
-          notes: v.notes,
-          added_by: usernames.get(v.added_by) ?? null,
-          visits: v.visits.map((x) => ({ visited_on: x.visited_on, note: x.note, by: usernames.get(x.user_id) ?? null })),
-          ratings: v.ratings.map((r) => ({ stars: r.stars, by: usernames.get(r.user_id) ?? null })),
-        })),
-      })),
-    };
-  }
-
-  function importData(data, importer) {
-    if (data?.app !== 'triptaster' || data.format !== 1 || !Array.isArray(data.trips)) {
-      throw new HttpError(400, 'That isn’t a TripTaster export file');
-    }
-    const userId = (username) =>
-      typeof username === 'string' ? (db.prepare('SELECT id FROM users WHERE username = ?').get(username)?.id ?? null) : null;
-    let venueCount = 0;
-    transaction(db, () => {
-      for (const rawTrip of data.trips) {
-        const trip = validateTrip(rawTrip);
-        const tripId = Number(
-          db.prepare('INSERT INTO trips (name, city, created_by) VALUES (?, ?, ?)').run(trip.name, trip.city, importer.id).lastInsertRowid,
-        );
-        for (const rawVenue of Array.isArray(rawTrip.venues) ? rawTrip.venues : []) {
-          const venueId = saveVenue(validateVenue(rawVenue), { tripId, userId: userId(rawVenue.added_by) });
-          venueCount += 1;
-          for (const visit of Array.isArray(rawVenue.visits) ? rawVenue.visits : []) {
-            if (!validDate(visit.visited_on)) throw new HttpError(400, `A visit to ${rawVenue.name} has an invalid date`);
-            db.prepare('INSERT INTO visits (venue_id, visited_on, note, user_id) VALUES (?, ?, ?, ?)').run(
-              venueId,
-              visit.visited_on,
-              shortText(visit.note, 'Visit note', 2000),
-              userId(visit.by),
-            );
-          }
-          for (const rating of Array.isArray(rawVenue.ratings) ? rawVenue.ratings : []) {
-            const raterId = userId(rating.by);
-            if (raterId && [1, 2, 3, 4, 5].includes(rating.stars)) {
-              db.prepare('INSERT OR REPLACE INTO ratings (venue_id, user_id, stars) VALUES (?, ?, ?)').run(venueId, raterId, rating.stars);
-            }
-          }
-        }
-      }
-    });
-    return { trips: data.trips.length, venues: venueCount };
-  }
+  const backupContext = (user) => ({ db, photos, importerId: user.id, photoLimitBytes: config.photoLimitBytes || 0 });
 
   // Routes. Each is [method, pattern, access, handler]; access is 'public', 'user' or 'admin'.
 
@@ -553,19 +466,37 @@ export function createApp(config) {
     json(res, 200, { ok: true });
   });
 
-  route('GET', '/api/admin/export', 'admin', ({ res }) => {
-    json(res, 200, exportData(), {
-      'Content-Disposition': `attachment; filename="triptaster-${new Date().toISOString().slice(0, 10)}.json"`,
+  route('GET', '/api/admin/export', 'admin', async ({ res }) => {
+    res.writeHead(200, {
+      'Content-Type': 'application/x-tar',
+      'Content-Disposition': `attachment; filename="triptaster-${new Date().toISOString().slice(0, 10)}.tar"`,
+      'Cache-Control': 'no-store',
     });
+    await writeBackup(db, photos, res);
   });
 
   route('POST', '/api/admin/import', 'admin', async ({ req, res, user }) => {
-    json(res, 201, importData(await readJson(req, 10 * 1024 * 1024), user));
+    const type = req.headers['content-type'] || '';
+    if (type.startsWith('application/json')) {
+      return json(res, 201, await restoreJson(backupContext(user), await readJson(req, 10 * 1024 * 1024)));
+    }
+    if (!type.startsWith('application/x-tar') && !type.startsWith('application/octet-stream')) {
+      throw new HttpError(415, 'Choose a TripTaster backup (.tar, or .json from version 1.0)');
+    }
+    json(res, 201, await restoreArchive(backupContext(user), req));
+  });
+
+  route('GET', '/api/admin/storage', 'admin', ({ res }) => {
+    json(res, 200, {
+      photo_bytes: photoBytesUsed(db),
+      photo_count: db.prepare('SELECT COUNT(*) AS n FROM photos').get().n,
+      photo_limit_bytes: config.photoLimitBytes || null,
+    });
   });
 
   // Trips
 
-  route('GET', '/api/trips', 'user', ({ res }) => json(res, 200, listTrips()));
+  route('GET', '/api/trips', 'user', ({ res }) => json(res, 200, listTrips(db)));
 
   route('POST', '/api/trips', 'user', async ({ req, res, user }) => {
     const trip = validateTrip(await readJson(req));
@@ -582,20 +513,23 @@ export function createApp(config) {
   });
 
   route('DELETE', /^\/api\/trips\/(\d+)$/, 'user', ({ res, params }) => {
-    db.prepare('DELETE FROM trips WHERE id = ?').run(Number(params[0]));
+    const id = Number(params[0]);
+    const files = photosOfTrip(db, id);
+    db.prepare('DELETE FROM trips WHERE id = ?').run(id);
+    photos.remove(files);
     json(res, 200, { ok: true });
   });
 
   route('GET', /^\/api\/trips\/(\d+)\/venues$/, 'user', ({ res, params }) => {
     const id = Number(params[0]);
     requireTrip(id);
-    json(res, 200, listVenues(id));
+    json(res, 200, listVenues(db, id));
   });
 
   route('POST', /^\/api\/trips\/(\d+)\/venues$/, 'user', async ({ req, res, params, user }) => {
     const tripId = Number(params[0]);
     requireTrip(tripId);
-    const id = saveVenue(validateVenue(await readJson(req)), { tripId, userId: user.id });
+    const id = insertVenue(db, validateVenue(await readJson(req)), { tripId, userId: user.id });
     json(res, 201, { id });
   });
 
@@ -604,12 +538,88 @@ export function createApp(config) {
   route('PUT', /^\/api\/venues\/(\d+)$/, 'user', async ({ req, res, params }) => {
     const venueId = Number(params[0]);
     requireVenue(venueId);
-    saveVenue(validateVenue(await readJson(req)), { venueId });
+    updateVenue(db, validateVenue(await readJson(req)), venueId);
     json(res, 200, { ok: true });
   });
 
   route('DELETE', /^\/api\/venues\/(\d+)$/, 'user', ({ res, params }) => {
-    db.prepare('DELETE FROM venues WHERE id = ?').run(Number(params[0]));
+    const id = Number(params[0]);
+    const files = photosOfVenue(db, id);
+    db.prepare('DELETE FROM venues WHERE id = ?').run(id);
+    photos.remove(files);
+    json(res, 200, { ok: true });
+  });
+
+  // Photos. The phone uploads the thumbnail and the full photo in one request:
+  // thumbnail bytes first, then the photo, with X-Thumb-Length marking the split.
+
+  route('POST', /^\/api\/venues\/(\d+)\/photos$/, 'user', async ({ req, res, url, params, user }) => {
+    const venueId = Number(params[0]);
+    requireVenue(venueId);
+    if (!Object.values(PHOTO_MIME).includes(req.headers['content-type'])) throw new HttpError(415, 'Photos must be JPEG or WebP');
+    const thumbLength = Number(req.headers['x-thumb-length']);
+    const body = await readBody(req, MAX_PHOTO_BYTES + MAX_THUMB_BYTES);
+    if (!Number.isInteger(thumbLength) || thumbLength < 1 || thumbLength > MAX_THUMB_BYTES || thumbLength >= body.length) {
+      throw new HttpError(400, 'The photo upload was incomplete');
+    }
+    const thumb = body.subarray(0, thumbLength);
+    const full = body.subarray(thumbLength);
+    if (full.length > MAX_PHOTO_BYTES) throw new HttpError(413, 'That photo is too big');
+    const type = imageType(full);
+    if (!type || imageType(thumb) !== type) throw new HttpError(415, 'Photos must be JPEG or WebP');
+
+    let visitId = null;
+    if (url.searchParams.has('visit')) {
+      visitId = Number(url.searchParams.get('visit'));
+      const visit = db.prepare('SELECT venue_id FROM visits WHERE id = ?').get(visitId);
+      if (!visit) visitId = null; // The visit was deleted while the photo waited to upload.
+      else if (visit.venue_id !== venueId) throw new HttpError(400, 'That visit belongs to a different place');
+    }
+    const size = (name) => {
+      const value = Number(req.headers[name]);
+      return Number.isInteger(value) && value > 0 && value <= 20000 ? value : null;
+    };
+    if (config.photoLimitBytes && photoBytesUsed(db) + body.length > config.photoLimitBytes) {
+      throw new HttpError(507, 'Photo storage is full. Ask an admin to make room.');
+    }
+    const file = await photos.save(full, thumb, type);
+    const id = insertPhoto(db, {
+      venueId,
+      visitId,
+      userId: user.id,
+      file,
+      type,
+      width: size('x-width'),
+      height: size('x-height'),
+      bytes: body.length,
+    });
+    json(res, 201, { id });
+  });
+
+  route('GET', /^\/api\/photos\/(\d+)\/(full|thumb)$/, 'user', ({ req, res, params }) => {
+    const photo = requirePhoto(Number(params[0]));
+    const target = photos.paths(photo.file, photo.type)[params[1]];
+    let size;
+    try {
+      size = fs.statSync(target).size;
+    } catch {
+      throw new HttpError(404, 'That photo is missing');
+    }
+    res.writeHead(200, {
+      'Content-Type': PHOTO_MIME[photo.type],
+      'Content-Length': size,
+      // Photos never change, so phones can keep them.
+      'Cache-Control': 'private, max-age=31536000, immutable',
+    });
+    if (req.method === 'HEAD') return res.end();
+    fs.createReadStream(target).pipe(res);
+  });
+
+  route('DELETE', /^\/api\/photos\/(\d+)$/, 'user', ({ res, params, user }) => {
+    const photo = requirePhoto(Number(params[0]));
+    if (photo.user_id !== user.id && user.role !== 'admin') throw new HttpError(403, 'Only the person who added a photo can delete it');
+    db.prepare('DELETE FROM photos WHERE id = ?').run(photo.id);
+    photos.remove([photo]);
     json(res, 200, { ok: true });
   });
 

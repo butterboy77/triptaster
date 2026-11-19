@@ -15,9 +15,12 @@ const SIGNIN_ERRORS = {
 };
 const POLL_MS = 30_000;
 const TRIP_KEY = 'triptaster.trip';
+const PHOTO_MAX_SIDE = 2048;
+const THUMB_MAX_SIDE = 640;
 
 const app = document.getElementById('app');
 const sheet = document.getElementById('sheet');
+const viewer = document.getElementById('viewer');
 const toastEl = document.getElementById('toast');
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
@@ -37,6 +40,7 @@ const state = {
   dipVetoes: new Set(),
   dipSpinning: false,
   dipWinner: null,
+  pending: [], // Photos waiting to upload: { id, venueId, visitId, url }
 };
 let openVenueId = null;
 let lastSnapshot = null;
@@ -44,9 +48,9 @@ let lastSnapshot = null;
 const esc = (value) =>
   String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 
-// An open modal sheet sits in the top layer, so the toast has to live inside it to be seen.
+// Open modal dialogs sit in the top layer, so the toast has to live inside the topmost one to be seen.
 function placeToast() {
-  (sheet.open ? sheet : document.body).append(toastEl);
+  (viewer.open ? viewer : sheet.open ? sheet : document.body).append(toastEl);
 }
 
 function toast(message) {
@@ -255,7 +259,9 @@ function venueCard(venue) {
   const avg = averageStars(venue);
   return `
     <button class="venue-card" data-action="open-venue" data-id="${venue.id}">
-      <span class="venue-emoji tint-${esc(venue.kind)}" aria-hidden="true">${kind?.emoji ?? '🍴'}</span>
+      ${venue.photos.length
+        ? `<img class="venue-emoji venue-photo" src="${photoUrl(venue.photos[0], 'thumb')}" alt="" loading="lazy">`
+        : `<span class="venue-emoji tint-${esc(venue.kind)}" aria-hidden="true">${kind?.emoji ?? '🍴'}</span>`}
       <span class="venue-text">
         <span class="venue-name">${esc(venue.name)}</span><br>
         <span class="venue-meta">${esc(metaLine(venue))}</span>
@@ -350,7 +356,8 @@ function dipView() {
 
 function resultCard(venue, remaining) {
   return `
-    <article class="result" aria-live="polite">
+    <article class="result ${venue.photos.length ? 'has-photo' : ''}" aria-live="polite">
+      ${venue.photos.length ? `<img class="result-photo" src="${photoUrl(venue.photos[0], 'thumb')}" alt="">` : ''}
       <div class="result-kicker">The dip has spoken</div>
       <h2>${esc(venue.name)}</h2>
       <p class="result-meta">${esc(metaLine(venue))}</p>
@@ -392,6 +399,7 @@ function diaryView() {
         <span class="venue-name">${esc(venue.name)}</span>
         ${stars ? `<br><span class="diary-stars">${stars}</span>` : ''}
         ${visit.note ? `<p class="diary-note">${esc(visit.note)}</p>` : ''}
+        ${diaryPhotos(venue, visit)}
       </button>`;
   }).join('');
   return `
@@ -425,7 +433,10 @@ function render() {
   app.innerHTML = `
     <header class="topbar ${onDip ? 'on-hero' : ''}">
       ${trip ? `<button class="trip-switch" data-action="trips" aria-label="Switch trip">🧳 <span>${esc(trip.name)}</span> ▾</button>` : '<span></span>'}
-      <button class="avatar" data-action="settings" aria-label="Settings">${esc(initials(state.me.display_name))}</button>
+      <span class="topbar-end">
+        ${state.pending.length ? `<button class="upload-badge" data-action="retry-uploads" aria-label="${state.pending.length} photos waiting to upload">⬆ ${state.pending.length}</button>` : ''}
+        <button class="avatar" data-action="settings" aria-label="Settings">${esc(initials(state.me.display_name))}</button>
+      </span>
     </header>
     <main class="page ${onDip ? 'page-dip' : ''}">
       ${state.offline ? '<p class="offline">You’re offline, so this is the last saved list.</p>' : ''}
@@ -515,7 +526,10 @@ function closeSheet() {
 }
 
 addEventListener('popstate', () => {
-  if (sheet.open) {
+  if (viewer.open) {
+    viewer.close();
+    placeToast();
+  } else if (sheet.open) {
     sheet.close();
     placeToast();
     openVenueId = null;
@@ -599,6 +613,8 @@ function renderDetail(id) {
       <a class="btn secondary" href="${esc(mapsLink(venue))}" target="_blank" rel="noopener">📍 Maps</a>
       <button class="btn lagoon" data-action="log-visit" data-id="${id}">We went!</button>
     </div>
+    <h3 class="section-title">Photos</h3>
+    ${gallery(venue)}
     <h3 class="section-title">Ratings</h3>
     <div class="rate-row"><strong>You</strong><span class="star-input">${myStars}</span></div>
     ${otherRatings}
@@ -619,8 +635,193 @@ function visitForm(id) {
     <form data-form="visit" data-id="${id}">
       <label class="field"><span>When</span><input name="visited_on" type="date" required value="${todayIso()}" max="${todayIso()}"></label>
       <label class="field"><span>What was good?</span><textarea name="note" rows="4" maxlength="2000" placeholder="The dish you’ll still be talking about at home…"></textarea></label>
+      <label class="btn secondary block file-btn">📷 Add photos<input type="file" name="photos" accept="image/*" multiple data-input="visit-photos"></label>
+      <p class="hint photo-count" aria-live="polite"></p>
       <button class="btn block lagoon">Save to our diary</button>
     </form>`);
+}
+
+// Photos
+
+const photoUrl = (photo, size) => `/api/photos/${photo.id}/${size}`;
+
+function gallery(venue) {
+  const pending = state.pending.filter((p) => p.venueId === venue.id);
+  const thumbs = venue.photos
+    .map((photo, i) => `<button class="thumb" data-action="view-photo" data-venue="${venue.id}" data-index="${i}" aria-label="Photo ${i + 1}">
+        <img src="${photoUrl(photo, 'thumb')}" alt="" loading="lazy"></button>`)
+    .join('');
+  const waiting = pending.map((p) => `<div class="thumb waiting" title="Waiting to upload"><img src="${p.url}" alt=""></div>`).join('');
+  return `<div class="gallery">
+    ${thumbs}${waiting}
+    <label class="thumb add-photo">
+      <span aria-hidden="true">📷</span>Add photos
+      <input type="file" accept="image/*" multiple data-input="photos" data-venue="${venue.id}">
+    </label>
+  </div>`;
+}
+
+function diaryPhotos(venue, visit) {
+  const photos = venue.photos.filter((p) => p.visit_id === visit.id).slice(0, 4);
+  if (!photos.length) return '';
+  return `<span class="diary-photos">${photos.map((p) => `<img src="${photoUrl(p, 'thumb')}" alt="" loading="lazy">`).join('')}</span>`;
+}
+
+function storageText(storage) {
+  const size = (bytes) => (bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : `${Math.max(1, Math.round(bytes / 1e6))} MB`);
+  if (!storage.photo_count) return 'No photos yet.';
+  const used = `${storage.photo_count} ${storage.photo_count === 1 ? 'photo uses' : 'photos use'} ${size(storage.photo_bytes)}`;
+  return storage.photo_limit_bytes ? `${used} of ${size(storage.photo_limit_bytes)}.` : `${used}.`;
+}
+
+function openViewer(venueId, index) {
+  const venue = venueById(venueId);
+  if (!venue?.photos.length) return;
+  viewer.innerHTML = `
+    <div class="viewer-track">
+      ${venue.photos.map((photo) => `
+        <figure class="viewer-slide">
+          <img src="${photoUrl(photo, 'full')}" alt="" ${photo.width ? `width="${photo.width}" height="${photo.height}"` : ''} loading="lazy">
+          <figcaption>
+            <span>${esc(userName(photo.user_id))} · ${esc(formatDate(photo.created_at.slice(0, 10)))}</span>
+            ${photo.user_id === state.me.id || state.me.role === 'admin' ? `<button class="link-btn light" data-action="delete-photo" data-id="${photo.id}">Delete</button>` : ''}
+          </figcaption>
+        </figure>`).join('')}
+    </div>
+    <button class="close viewer-close" data-action="close-viewer" aria-label="Close">✕</button>`;
+  viewer.showModal();
+  history.pushState({ viewer: true }, '');
+  placeToast();
+  const track = viewer.querySelector('.viewer-track');
+  requestAnimationFrame(() => track.scrollTo({ left: index * track.clientWidth }));
+}
+
+function closeViewer() {
+  if (!viewer.open) return;
+  viewer.close();
+  placeToast();
+  if (history.state?.viewer) history.back();
+}
+
+viewer.addEventListener('cancel', (event) => {
+  event.preventDefault();
+  closeViewer();
+});
+
+// Shrinks a photo on the phone, so uploads are quick on mobile data and location data is dropped.
+async function shrinkPhoto(file) {
+  const bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
+  const draw = (maxSide, quality) => {
+    const scale = Math.min(1, maxSide / Math.max(bitmap.width, bitmap.height));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(bitmap.width * scale);
+    canvas.height = Math.round(bitmap.height * scale);
+    canvas.getContext('2d').drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    return new Promise((resolve, reject) =>
+      canvas.toBlob((blob) => (blob ? resolve({ blob, width: canvas.width, height: canvas.height }) : reject(new Error('encode'))), 'image/jpeg', quality),
+    );
+  };
+  try {
+    const full = await draw(PHOTO_MAX_SIDE, 0.82);
+    const thumb = await draw(THUMB_MAX_SIDE, 0.78);
+    return { full: full.blob, thumb: thumb.blob, width: full.width, height: full.height };
+  } finally {
+    bitmap.close();
+  }
+}
+
+// Photos wait in IndexedDB until they upload, so nothing is lost on a bad connection.
+const uploads = {
+  open() {
+    this.db ??= new Promise((resolve, reject) => {
+      const request = indexedDB.open('triptaster', 1);
+      request.onupgradeneeded = () => request.result.createObjectStore('uploads', { keyPath: 'id', autoIncrement: true });
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    return this.db;
+  },
+  async run(mode, work) {
+    const db = await this.open();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction('uploads', mode);
+      const request = work(tx.objectStore('uploads'));
+      tx.oncomplete = () => resolve(request?.result);
+      tx.onerror = () => reject(tx.error);
+    });
+  },
+  add: (item) => uploads.run('readwrite', (store) => store.add(item)),
+  all: () => uploads.run('readonly', (store) => store.getAll()),
+  remove: (id) => uploads.run('readwrite', (store) => store.delete(id)),
+  clear: () => uploads.run('readwrite', (store) => store.clear()),
+};
+
+async function loadPending() {
+  for (const p of state.pending) URL.revokeObjectURL(p.url);
+  const items = await uploads.all().catch(() => []);
+  state.pending = items.map((item) => ({ id: item.id, venueId: item.venueId, visitId: item.visitId, url: URL.createObjectURL(item.thumb) }));
+  render();
+  if (openVenueId !== null && sheet.open && !sheet.querySelector('form')) renderDetail(openVenueId);
+}
+
+async function addPhotos(files, venueId, visitId) {
+  let unreadable = 0;
+  for (const file of files) {
+    try {
+      const photo = await shrinkPhoto(file);
+      await uploads.add({ venueId, visitId, ...photo, added: Date.now() });
+    } catch {
+      unreadable += 1;
+    }
+  }
+  if (unreadable) toast(`${unreadable} ${unreadable === 1 ? 'photo' : 'photos'} couldn’t be read. Try a JPEG.`);
+  await loadPending();
+  processQueue();
+}
+
+let uploading = false;
+async function processQueue() {
+  if (uploading || !navigator.onLine) return;
+  uploading = true;
+  let sent = 0;
+  try {
+    for (const item of await uploads.all()) {
+      let res;
+      try {
+        res = await fetch(`/api/venues/${item.venueId}/photos${item.visitId ? `?visit=${item.visitId}` : ''}`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'image/jpeg',
+            'X-Thumb-Length': String(item.thumb.size),
+            'X-Width': String(item.width),
+            'X-Height': String(item.height),
+          },
+          body: new Blob([item.thumb, item.full]),
+        });
+      } catch {
+        break; // Offline or the server is unreachable: try again later.
+      }
+      if (res.ok) {
+        await uploads.remove(item.id);
+        sent += 1;
+      } else if (res.status === 404) {
+        await uploads.remove(item.id); // The place was deleted.
+      } else if ([400, 413, 415].includes(res.status)) {
+        await uploads.remove(item.id);
+        toast((await res.json().catch(() => ({}))).error || 'A photo couldn’t be uploaded');
+      } else {
+        if (res.status === 507) toast('Photo storage is full. Ask an admin to make room.');
+        break; // Signed out, storage full or a server problem: keep the photo and try later.
+      }
+    }
+  } finally {
+    uploading = false;
+  }
+  if (sent) {
+    await refresh().catch(() => {});
+    toast(`${sent} ${sent === 1 ? 'photo' : 'photos'} added 📷`);
+  }
+  await loadPending();
 }
 
 // Trips sheet
@@ -671,7 +872,7 @@ async function settingsSheet() {
   let people = '';
   if (isAdmin) {
     try {
-      const [users, invites] = await Promise.all([api('/api/admin/users'), api('/api/admin/invites')]);
+      const [users, invites, storage] = await Promise.all([api('/api/admin/users'), api('/api/admin/invites'), api('/api/admin/storage')]);
       people = `
         <h3 class="section-title">People</h3>
         ${users.map((u) => `
@@ -692,11 +893,12 @@ async function settingsSheet() {
           <button class="btn secondary" data-action="invite" data-role="admin">Invite an admin</button>
         </div>
         <h3 class="section-title">Backup</h3>
+        <p class="hint">${esc(storageText(storage))}</p>
         <div class="detail-actions">
-          <button class="btn secondary" data-action="export">Download backup</button>
-          <label class="btn secondary file-btn">Restore trips<input type="file" accept="application/json,.json" data-input="import"></label>
+          <a class="btn secondary" href="/api/admin/export" download>Download backup</a>
+          <label class="btn secondary file-btn">Restore trips<input type="file" accept=".tar,.json,application/x-tar,application/json" data-input="import"></label>
         </div>
-        <p class="hint">Restoring adds the trips in the file as new trips. Nothing is overwritten.</p>`;
+        <p class="hint">Backups include photos. Restoring adds the trips in the file as new trips, and nothing is overwritten. For very large backups, use the command line (see the README).</p>`;
     } catch (err) {
       people = `<p class="hint">${esc(err.message)}</p>`;
     }
@@ -877,25 +1079,12 @@ const actions = {
   share(el) {
     navigator.share({ title: 'Join me on TripTaster', url: el.dataset.url }).catch(() => {});
   },
-  async export() {
-    try {
-      const res = await fetch('/api/admin/export');
-      if (!res.ok) throw new Error();
-      const blob = await res.blob();
-      const a = Object.assign(document.createElement('a'), {
-        href: URL.createObjectURL(blob),
-        download: `triptaster-${todayIso()}.json`,
-      });
-      a.click();
-      setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
-    } catch {
-      toast('Couldn’t download the backup');
-    }
-  },
   async 'unlink-sso'() {
     if (await mutate('/api/me/sso', { method: 'DELETE' }, 'Unlinked')) settingsSheet();
   },
   async logout() {
+    if (state.pending.length && !confirm(`${state.pending.length} photos haven’t uploaded yet and will be lost. Sign out anyway?`)) return;
+    await uploads.clear().catch(() => {});
     await fetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
     // Cached data must not outlive the session on this phone.
     for (const name of await caches.keys()) {
@@ -905,6 +1094,18 @@ const actions = {
       }
     }
     location.href = '/';
+  },
+  'view-photo'(el) {
+    openViewer(Number(el.dataset.venue), Number(el.dataset.index));
+  },
+  'close-viewer': closeViewer,
+  async 'delete-photo'(el) {
+    if (!confirm('Delete this photo?')) return;
+    if (await mutate(`/api/photos/${el.dataset.id}`, { method: 'DELETE' }, 'Photo deleted')) closeViewer();
+  },
+  'retry-uploads'() {
+    toast(navigator.onLine ? 'Trying the uploads again…' : 'Photos will upload when you’re back online');
+    processQueue();
   },
   'setup-sso'(el) {
     const code = el.form.elements.code.value.trim();
@@ -932,17 +1133,32 @@ document.addEventListener('change', async (event) => {
     state.dipIncludeBeen = event.target.checked;
     state.dipWinner = null;
     render();
+  } else if (input === 'photos') {
+    const files = [...event.target.files];
+    event.target.value = '';
+    await addPhotos(files, Number(event.target.dataset.venue), null);
+  } else if (input === 'visit-photos') {
+    const count = event.target.files.length;
+    event.target.form.querySelector('.photo-count').textContent = count ? `${count} ${count === 1 ? 'photo' : 'photos'} ready to add` : '';
   } else if (input === 'import') {
     const file = event.target.files[0];
+    event.target.value = '';
     if (!file) return;
-    let data;
+    toast('Restoring…');
     try {
-      data = JSON.parse(await file.text());
-    } catch {
-      return toast('That file isn’t a TripTaster backup');
+      const res = await fetch('/api/admin/import', {
+        method: 'POST',
+        headers: { 'Content-Type': file.name.toLowerCase().endsWith('.json') ? 'application/json' : 'application/x-tar' },
+        body: file,
+      });
+      const result = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(result.error || 'The restore failed');
+      lastSnapshot = null;
+      await refresh();
+      toast(`Restored ${result.trips} ${result.trips === 1 ? 'trip' : 'trips'}, ${result.venues} places and ${result.photos} photos`);
+    } catch (err) {
+      toast(err.message);
     }
-    const result = await mutate('/api/admin/import', { method: 'POST', body: data });
-    if (result) toast(`Restored ${result.trips} ${result.trips === 1 ? 'trip' : 'trips'} with ${result.venues} places`);
   }
 });
 
@@ -985,6 +1201,7 @@ const forms = {
   },
   async visit(data, form) {
     const id = Number(form.dataset.id);
+    const files = [...form.elements.photos.files];
     const done = await mutate(`/api/venues/${id}/visits`, {
       method: 'POST',
       body: { visited_on: data.get('visited_on'), note: data.get('note') },
@@ -992,6 +1209,7 @@ const forms = {
     if (done) {
       state.dipWinner = null;
       renderDetail(id);
+      if (files.length) await addPhotos(files, id, done.id);
     }
   },
   async trip(data, form) {
@@ -1043,9 +1261,15 @@ document.addEventListener('submit', async (event) => {
 const quietRefresh = () => {
   if (state.me && !state.dipSpinning && document.visibilityState === 'visible') refresh().catch(() => {});
 };
-setInterval(quietRefresh, POLL_MS);
+setInterval(() => {
+  quietRefresh();
+  if (state.pending.length) processQueue();
+}, POLL_MS);
 document.addEventListener('visibilitychange', quietRefresh);
-addEventListener('online', quietRefresh);
+addEventListener('online', () => {
+  quietRefresh();
+  processQueue();
+});
 addEventListener('offline', () => {
   state.offline = true;
   render();
@@ -1059,6 +1283,8 @@ async function start() {
     await refresh();
     handleRedirectNotices();
     handleShareTarget();
+    await loadPending();
+    processQueue();
   } catch {
     if (!state.me) showSignIn();
   }

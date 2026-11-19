@@ -58,31 +58,33 @@ test('validation rejects bad input', async () => {
   assert.equal((await admin.json('/api/trips/99999/venues', { method: 'POST', body: venue })).status, 404);
 });
 
-test('export and import round-trip, matching people by username', async () => {
-  const exported = await admin.json('/api/admin/export');
-  assert.equal(exported.status, 200);
-  const bali = exported.body.trips.find((t) => t.name === 'Bali');
-  assert.deepEqual(bali.venues[0].ratings.map((r) => r.by).sort(), ['alex', 'sam']);
+test('backups from version 1.0 (JSON) still restore', async () => {
+  const legacy = {
+    app: 'triptaster',
+    format: 1,
+    trips: [{
+      name: 'Old trip',
+      city: 'Ubud',
+      venues: [{
+        name: 'Old warung',
+        kind: 'street_food',
+        visits: [{ visited_on: '2026-10-01', note: 'Lovely', by: 'alex' }],
+        ratings: [{ stars: 4, by: 'alex' }, { stars: 5, by: 'nobody-here' }],
+      }],
+    }],
+  };
+  const result = await admin.json('/api/admin/import', { method: 'POST', body: legacy });
+  assert.equal(result.status, 201);
+  assert.deepEqual(result.body, { trips: 1, venues: 1, photos: 0 });
+  const trip = (await admin.json('/api/trips')).body.find((t) => t.name === 'Old trip');
+  const [venue] = (await admin.json(`/api/trips/${trip.id}/venues`)).body;
+  assert.equal(venue.ratings.length, 1, 'ratings by unknown usernames are skipped');
+  assert.equal(venue.visits[0].note, 'Lovely');
 
-  const other = await startApp();
-  try {
-    const otherAdmin = await setupAdmin(other);
-    const result = await otherAdmin.json('/api/admin/import', { method: 'POST', body: exported.body });
-    assert.equal(result.status, 201);
-    const trips = (await otherAdmin.json('/api/trips')).body;
-    const imported = trips.find((t) => t.name === 'Bali');
-    const [venue] = (await otherAdmin.json(`/api/trips/${imported.id}/venues`)).body;
-    assert.equal(venue.ratings.length, 1, 'only alex exists here, so only alex’s rating comes across');
-    assert.equal(venue.visits[0].note, 'Sate!');
-
-    const bad = await otherAdmin.json('/api/admin/import', { method: 'POST', body: { app: 'something-else' } });
-    assert.equal(bad.status, 400);
-    const broken = structuredClone(exported.body);
-    broken.trips[0].venues.push({ name: 'Bad', kind: 'nope' });
-    const before = (await otherAdmin.json('/api/trips')).body.length;
-    assert.equal((await otherAdmin.json('/api/admin/import', { method: 'POST', body: broken })).status, 400);
-    assert.equal((await otherAdmin.json('/api/trips')).body.length, before, 'a failed import changes nothing');
-  } finally {
-    await other.close();
-  }
+  assert.equal((await admin.json('/api/admin/import', { method: 'POST', body: { app: 'something-else' } })).status, 400);
+  const broken = structuredClone(legacy);
+  broken.trips[0].venues.push({ name: 'Bad', kind: 'nope' });
+  const before = (await admin.json('/api/trips')).body.length;
+  assert.equal((await admin.json('/api/admin/import', { method: 'POST', body: broken })).status, 400);
+  assert.equal((await admin.json('/api/trips')).body.length, before, 'a failed restore changes nothing');
 });

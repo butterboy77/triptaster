@@ -18,13 +18,14 @@ SQLite file. There are no npm dependencies, and it fits in one small Docker cont
 - **Places:** name, type, meals, cuisine, price, Maps link, must-try dish and notes. Search, and filter by *To try* or *Been*.
 - **Lucky Dip:** pick a meal, spin, and get an answer, with a shower of frangipani petals. *Nope, again* rules a place out and spins again.
 - **Diary:** a dated record of every visit, with everyone's own star ratings.
+- **Photos:** add them to places and visits, then swipe through them full screen. Phones shrink photos before uploading and strip location data. Photos taken without signal wait on the phone and upload once you're back online.
 - **Trips:** keep each trip and city separate.
 - **Shared:** everyone on your server sees the same lists, and phones stay in sync.
 - **Installable and offline-friendly:** lists and the Lucky Dip keep working with no signal.
 - **Share from Google Maps** on Android to pre-fill a new place.
 - **Sign in** with a username and password, single sign-on through any OpenID Connect provider, or both.
 - **Invite links** for new people, plus admin and member roles.
-- **Backup and restore** as a JSON file.
+- **Backup and restore** as a single file, photos included.
 
 ## Quick start
 
@@ -60,6 +61,7 @@ Everything is set with environment variables, usually in `.env`:
 | `OIDC_LABEL` | `Single sign-on` | Button text, e.g. `Pocket ID` |
 | `OIDC_AUTO_REGISTER` | `false` | Give an account to anyone your provider signs in, without an invite |
 | `OIDC_ALLOWED_GROUPS` | | Comma-separated groups, read from the `groups` claim, allowed in |
+| `PHOTO_STORAGE_LIMIT_GB` | *(no limit)* | Maximum total photo storage, e.g. `5` |
 | `PORT` | `3000` | Port inside the container |
 | `DATA_DIR` | `/data` | Where the database lives |
 
@@ -79,18 +81,19 @@ scopes `openid profile email` (plus `groups` if you use `OIDC_ALLOWED_GROUPS`). 
 docker exec triptaster node cli.js list-users
 docker exec triptaster node cli.js reset-password <username>   # prints a reset link
 docker exec triptaster node cli.js invite-admin                 # if every admin is locked out
+docker exec triptaster node cli.js export > triptaster-backup.tar
+docker exec -i triptaster node cli.js import - < triptaster-backup.tar
 ```
 
 ## Backups
 
-Admins can use **Settings → Download backup** to get a JSON file, and **Restore trips** to add one
-back. Restoring adds the trips as new ones rather than overwriting. To copy the whole database,
-including people:
+Admins can use **Settings → Download backup** to get a `.tar` file of every trip, place, visit,
+rating and photo. **Restore trips** adds a backup's trips as new ones, rather than overwriting, and
+also accepts `.json` backups from version 1.0. Reverse proxies and tunnels often cap upload sizes
+(Cloudflare allows 100 MB), so restore large backups with the `import` command above instead.
 
-```sh
-docker exec triptaster node -e "new (require('node:sqlite').DatabaseSync)('/data/triptaster.db').exec(\"VACUUM INTO '/data/backup.db'\")"
-docker cp triptaster:/data/backup.db ./triptaster-backup.db
-```
+Everything, including people and sign-in details, lives in the `/data` volume. Backing up that
+volume while the container is stopped captures the lot.
 
 ## Development
 
@@ -107,6 +110,9 @@ The code is plain JavaScript with no build step:
 |---|---|
 | `src/app.js` | Routes and business logic |
 | `src/auth.js` | Passwords, rate limiting and OpenID Connect |
+| `src/store.js` | Database queries shared by the routes, backups and CLI |
+| `src/photos.js` | Photo file storage |
+| `src/backup.js`, `src/tar.js` | Backup and restore |
 | `src/db.js` | Schema and migrations |
 | `public/` | The app itself (HTML, CSS, JavaScript and service worker) |
 

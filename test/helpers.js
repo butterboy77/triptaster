@@ -92,15 +92,16 @@ export async function startIdp() {
   return idp;
 }
 
-export async function startApp({ oidc = null, passwordLogin = true } = {}) {
+export async function startApp({ oidc = null, passwordLogin = true, photoLimitBytes = 0, dataDir: reuseDir } = {}) {
   const port = await freePort();
   const url = `http://127.0.0.1:${port}`;
-  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'triptaster-test-'));
+  const dataDir = reuseDir ?? fs.mkdtempSync(path.join(os.tmpdir(), 'triptaster-test-'));
   const logs = [];
   const server = createApp({
     baseUrl: url,
     dataDir,
     passwordLogin,
+    photoLimitBytes,
     trustProxy: false,
     oidc: oidc && { clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, label: 'Test SSO', ...oidc },
     scryptN: 2 ** 10, // Fast hashing for tests only.
@@ -112,11 +113,28 @@ export async function startApp({ oidc = null, passwordLogin = true } = {}) {
     logs,
     setupCode: () => logs.join('\n').match(/[A-Z2-9]{4}-[A-Z2-9]{4}-[A-Z2-9]{4}-[A-Z2-9]{4}/)?.[0],
     client: () => new Client(url),
-    close: async () => {
-      await new Promise((resolve) => server.close(resolve));
-      fs.rmSync(dataDir, { recursive: true, force: true });
+    dataDir,
+    // Pass { keepData: true } to restart a server on the same data.
+    close: async ({ keepData = false } = {}) => {
+      const closed = new Promise((resolve) => server.close(resolve));
+      server.closeAllConnections();
+      await closed;
+      if (!keepData) fs.rmSync(dataDir, { recursive: true, force: true });
     },
   };
+}
+
+// Bytes that pass the server's JPEG check. Real decoding happens on phones, not the server.
+export function fakeJpeg(size = 2000) {
+  return Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), crypto.randomBytes(size)]);
+}
+
+export function uploadPhoto(client, venueId, { full = fakeJpeg(5000), thumb = fakeJpeg(500), visit, type = 'image/jpeg' } = {}) {
+  return client.json(`/api/venues/${venueId}/photos${visit ? `?visit=${visit}` : ''}`, {
+    method: 'POST',
+    raw: Buffer.concat([thumb, full]),
+    headers: { 'Content-Type': type, 'X-Thumb-Length': String(thumb.length), 'X-Width': '2048', 'X-Height': '1536' },
+  });
 }
 
 export class Client {
@@ -125,7 +143,8 @@ export class Client {
     this.cookies = {};
   }
 
-  async fetch(target, { method = 'GET', body, headers = {} } = {}) {
+  // `body` is sent as JSON; `raw` is sent as-is (set Content-Type in `headers`).
+  async fetch(target, { method = 'GET', body, raw, headers = {} } = {}) {
     const url = target.startsWith('http') ? target : this.base + target;
     const ours = url.startsWith(this.base);
     const res = await fetch(url, {
@@ -136,7 +155,7 @@ export class Client {
         ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
         ...headers,
       },
-      body: body === undefined ? undefined : JSON.stringify(body),
+      body: raw ?? (body === undefined ? undefined : JSON.stringify(body)),
     });
     if (ours) {
       for (const raw of res.headers.getSetCookie()) {

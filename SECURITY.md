@@ -17,6 +17,8 @@
 - Repeated failed sign-ins are slowed down per address and per username.
 - Writes are refused from other sites (Origin checks, JSON-only requests, SameSite cookies).
 - A strict Content Security Policy is sent with every page.
+- Uploaded photos must really be JPEG or WebP (checked by their contents, not their name), are
+  size-limited, are stored under random names, and are only served to signed-in people.
 - Single sign-on uses the authorization code flow with PKCE, with full ID token checks.
 
 ## Reporting a problem

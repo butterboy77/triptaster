@@ -66,6 +66,21 @@ const MIGRATIONS = [
     PRIMARY KEY (venue_id, user_id)
   );
   `,
+  `
+  CREATE TABLE photos (
+    id INTEGER PRIMARY KEY,
+    venue_id INTEGER NOT NULL REFERENCES venues(id) ON DELETE CASCADE,
+    visit_id INTEGER REFERENCES visits(id) ON DELETE SET NULL,
+    user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    file TEXT NOT NULL UNIQUE,
+    type TEXT NOT NULL CHECK (type IN ('jpeg', 'webp')),
+    width INTEGER,
+    height INTEGER,
+    bytes INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+  CREATE INDEX photos_venue ON photos(venue_id);
+  `,
 ];
 
 export function openDb(dataDir) {
