@@ -44,6 +44,7 @@ const state = {
 };
 let openVenueId = null;
 let lastSnapshot = null;
+const visitPhotos = new WeakMap(); // Visit form -> photos picked so far
 
 const esc = (value) =>
   String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
@@ -635,7 +636,10 @@ function visitForm(id) {
     <form data-form="visit" data-id="${id}">
       <label class="field"><span>When</span><input name="visited_on" type="date" required value="${todayIso()}" max="${todayIso()}"></label>
       <label class="field"><span>What was good?</span><textarea name="note" rows="4" maxlength="2000" placeholder="The dish you’ll still be talking about at home…"></textarea></label>
-      <label class="btn secondary block file-btn">📷 Add photos<input type="file" name="photos" accept="image/*" multiple data-input="visit-photos"></label>
+      <div class="photo-buttons">
+        <label class="btn secondary file-btn">📷 Take photo<input type="file" accept="image/*" capture="environment" data-input="visit-photos"></label>
+        <label class="btn secondary file-btn">🖼️ Choose<input type="file" accept="image/*" multiple data-input="visit-photos"></label>
+      </div>
       <p class="hint photo-count" aria-live="polite"></p>
       <button class="btn block lagoon">Save to our diary</button>
     </form>`);
@@ -652,13 +656,12 @@ function gallery(venue) {
         <img src="${photoUrl(photo, 'thumb')}" alt="" loading="lazy"></button>`)
     .join('');
   const waiting = pending.map((p) => `<div class="thumb waiting" title="Waiting to upload"><img src="${p.url}" alt=""></div>`).join('');
-  return `<div class="gallery">
-    ${thumbs}${waiting}
-    <label class="thumb add-photo">
-      <span aria-hidden="true">📷</span>Add photos
-      <input type="file" accept="image/*" multiple data-input="photos" data-venue="${venue.id}">
-    </label>
-  </div>`;
+  return `
+    ${thumbs || waiting ? `<div class="gallery">${thumbs}${waiting}</div>` : ''}
+    <div class="photo-buttons">
+      <label class="btn secondary file-btn">📷 Take photo<input type="file" accept="image/*" capture="environment" data-input="photos" data-venue="${venue.id}"></label>
+      <label class="btn secondary file-btn">🖼️ Choose<input type="file" accept="image/*" multiple data-input="photos" data-venue="${venue.id}"></label>
+    </div>`;
 }
 
 function diaryPhotos(venue, visit) {
@@ -1138,8 +1141,12 @@ document.addEventListener('change', async (event) => {
     event.target.value = '';
     await addPhotos(files, Number(event.target.dataset.venue), null);
   } else if (input === 'visit-photos') {
-    const count = event.target.files.length;
-    event.target.form.querySelector('.photo-count').textContent = count ? `${count} ${count === 1 ? 'photo' : 'photos'} ready to add` : '';
+    // Keep each pick, so several camera shots can be added before saving.
+    const form = event.target.form;
+    visitPhotos.set(form, [...(visitPhotos.get(form) ?? []), ...event.target.files]);
+    event.target.value = '';
+    const count = visitPhotos.get(form).length;
+    form.querySelector('.photo-count').textContent = `${count} ${count === 1 ? 'photo' : 'photos'} ready to add`;
   } else if (input === 'import') {
     const file = event.target.files[0];
     event.target.value = '';
@@ -1201,7 +1208,7 @@ const forms = {
   },
   async visit(data, form) {
     const id = Number(form.dataset.id);
-    const files = [...form.elements.photos.files];
+    const files = visitPhotos.get(form) ?? [];
     const done = await mutate(`/api/venues/${id}/visits`, {
       method: 'POST',
       body: { visited_on: data.get('visited_on'), note: data.get('note') },

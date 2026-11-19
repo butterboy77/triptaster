@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.1
+
+- Separate **Take photo** and **Choose** buttons. Newer Android phones open a photo picker with no camera option, so the camera now has its own button.
+- In the "We went!" form, you can take several photos one after another before saving.
+
 ## 1.1.0
 
 - **Photos.** Add photos to places and visits from the camera or gallery, see them as tiles on the
